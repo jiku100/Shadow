@@ -144,6 +144,13 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="drawing.h" />
+    <ClInclude Include="entropy.h" />
+    <ClInclude Include="header.h" />
+    <ClInclude Include="invariant.h" />
+    <ClInclude Include="lab.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
