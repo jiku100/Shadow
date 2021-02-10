@@ -1,3 +1,4 @@
+#include "header.h"
 #include "drawing.h"
 #include "entropy.h"
 #include "invariant.h"
@@ -5,110 +6,320 @@
 #include <stack>
 
 #define ENTROPY 0
-#define LAB 1
-#define DETECTION 0
+#define LAB 0
+#define DETECTION 1
+
+
+Point pointArray[25] =
+{
+	Point(0,0),
+	Point(-2,-2),
+	Point(-1,-2),
+	Point(0,-2),
+	Point(1,-2),
+	Point(2,-2),
+	Point(-2,-1),
+	Point(-1,-1),
+	Point(0,-1),
+	Point(1,-1),
+	Point(2,-1),
+	Point(-2,0),
+	Point(-1,0),
+	Point(1,0),
+	Point(2,0),
+	Point(-2,1),
+	Point(-1,1),
+	Point(0,1),
+	Point(1,1),
+	Point(2,1),
+	Point(-2,2),
+	Point(-1,2),
+	Point(0,2),
+	Point(1,2),
+	Point(2,2)
+};
 
 
 Mat src;
+Mat shadow_seed;
+Mat A;
+Mat MS;
+Mat ML;
+vector<Point> seeds;
+vector<Point> growing;
+vector<double> distances;
+vector<int> distances_norm;
+vector<Point> Y_growing;
+vector<Point> CbCr_growing;
 
-Point pointArray[8] =
-{
-	Point(1, -1),
-	Point(1, 0),
-	Point(0, -1),
-	Point(-1, -1),
-	Point(-1, 0),
-	Point(-1, 1),
-	Point(0, 1),
-	Point(1, 1)
-};
+Mat calcGrayHist(const Mat& img) {
+	CV_Assert(img.type() == CV_8UC1);
+	Mat hist;
+	int channels[] = { 0 };	// 히스토그램 계산 채널
+	int dims = 1;			// 출력 영상 차원
+	const int histSize[] = { 256 };	// 각 차원의 히스토그램 빈 개수
+	float graylevel[] = { 0,256 };	// GrayScale의 최솟값, 최댓값
+	const float* ranges[] = { graylevel }; // 각 차원의 히스토그램 범위
+	calcHist(&img, 1, channels, noArray(), hist, dims, histSize, ranges);
+	return hist;
+}
+Mat getGrayHistImage(const Mat& hist) {
+	CV_Assert(hist.type() == CV_32FC1);
+	CV_Assert(hist.size() == Size(1, 256));
+	double histMax;
+	minMaxLoc(hist, 0, &histMax);
+	Mat imgHist(100, 256, CV_8UC1, Scalar(255));
+	for (int i = 0; i < 256; i++) {
+		line(imgHist, Point(i, 100), Point(i, 100 - cvRound(hist.at<float>(i, 0) * 100 / histMax)), Scalar(0));
+	}
+	return imgHist;
+}
 
-stack<Point> seed;
-Mat dst;
+int get_threshold(const Mat& hist) {
+	float total = 0;
+	float count = 0;
+	for (int i = 0; i < hist.total(); i++) {
+		total += hist.at<float>(i, 0);
+	}
+	for (int i = 0; i < hist.total(); i++) {
+		count += hist.at<float>(i, 0);
+		if (count > total / 5)
+			return i;
+	}
+	return hist.total();
+}
 
-void mouse_click(int event, int x, int y, int flags, void* pt) {
-	static int i = 0;
-	if (i == 0) {
-		switch (event) {
-		case EVENT_LBUTTONDOWN:
-			Point pt = Point(x, y);
-			seed.push(pt);
-			
-			while (!seed.empty())
-			{
-				Point  topPoint = seed.top();
-				seed.pop();
-				Vec3b& seedColor = src.at<Vec3b>(topPoint.y, topPoint.x);
-				for (int i = 0; i < 8; i++)
-				{
+void normalize_vector(vector<double>& distance, vector<int>& distances_norm) {
+	double max = distance[0];
+	double min = distance[0];
+	for (int i = 0; i < distance.size(); i++) {
+		if (distance[i] > max)
+			max = distance[i];
+		if (distance[i] < min)
+			min = distance[i];
+	}
+	for (int i = 0; i < distance.size(); i++) {
+		distances_norm.push_back(255 * (distance[i] - min) / (max - min));
+	}
 
-					Point p = topPoint + pointArray[i];//p is the point to grow
-					int x = p.x;
-					int y = p.y;
+}
 
-					if (x<0 || y<0 || x>src.cols - 1 || y>src.rows - 1 || dst.at<uchar>(y,x) == 255)
-					{
-						continue;
-					}
-					Vec3b& srcColor = src.at<Vec3b>(y, x);
-					double srcColor_length = sqrtf((srcColor[0] * srcColor[0] + srcColor[1] * srcColor[1] + srcColor[2] * srcColor[2]));
-					double seedColor_length = sqrtf((seedColor[0] * seedColor[0] + seedColor[1] * seedColor[1] + seedColor[2] * seedColor[2]));
-					double distance = 1 - (srcColor[0] * seedColor[0] + srcColor[1] * seedColor[1] + srcColor[2] * seedColor[2]) / (srcColor_length * seedColor_length);
-					//The second point is not growing and the absolute value of the gray difference between the point to be grown and the first seed point is less than 10, then grow
-					if (distance < 3e-5)
-					{
-						dst.at<uchar>(y, x) = 255;//Use gray to indicate growth
-					   //Put this point on the stack
-						seed.push(p);
+double RGB_distance(Vec3b& seed, Vec3b& pixel) {
+	double dotProduct = (seed[0] * pixel[0] + seed[1] * pixel[1] + seed[2] * pixel[2]);
+	double seed_length = sqrt(seed[0] * seed[0] + seed[1] * seed[1] + seed[2] * seed[2]);
+	double pixel_length = sqrt(pixel[0] * pixel[0] + pixel[1] * pixel[1] + pixel[2] * pixel[2]);
+	double cos_theta = dotProduct / (seed_length * pixel_length);
+	return abs(cos_theta);
+}
+
+double Y_distance(double Y, Vec3b& pixel) {
+	double Y_ML = 0.299 * pixel[2] + 0.587 * pixel[1] + 0.114 * pixel[0];
+	return abs(Y - Y_ML);
+}
+
+double CbCr_distance(Vec3b& seed, Vec3b& pixel) {
+	double Cb_seed = 128 + (-0.169 * seed[2]) + (-0.331 * seed[1]) + 0.5 * seed[0];
+	double Cb_pixel = 128 + (-0.169 * pixel[2]) + (-0.331 * pixel[1]) + 0.5 * pixel[0];
+	double Cr_seed = 128 + 0.5 * seed[2] + (-0.419 * seed[1]) + (-0.081 * seed[0]);
+	double Cr_pixel = 128 + 0.5 * pixel[2] + (-0.419 * pixel[1]) + (-0.081 * pixel[0]);
+
+	double dotProdudct = Cb_seed * Cb_pixel + Cr_seed * Cr_pixel;
+	double seed_length = sqrt(Cb_seed * Cb_seed + Cr_seed * Cr_seed);
+	double pixel_length = sqrt(Cb_pixel * Cb_pixel + Cr_pixel * Cr_pixel);
+	double cos_theta = dotProdudct / (seed_length * pixel_length);
+	return abs(cos_theta);
+}
+
+double get_Point_distance(Point pt1, Point pt2) {
+	return sqrt(pow(pt1.x - pt2.x, 2) + pow(pt1.y - pt2.y, 2));
+}
+
+Vec3b get_median() {			// 현재 평균값
+	vector<int> r;
+	vector<int> g;
+	vector<int> b;
+
+	for (Point p : seeds) {
+		Vec3b& color = src.at<Vec3b>(p);
+		b.push_back(color[0]);
+		g.push_back(color[1]);
+		r.push_back(color[2]);
+	}
+	int median_b = b[b.size() / 2];
+	int median_g = g[g.size() / 2];
+	int median_r = r[r.size() / 2];
+	return Vec3b(median_b, median_g, median_r);
+}
+
+double get_seed_Y() {
+	double Y = 0;
+	for (Point p : seeds) {
+		Vec3b& color = src.at<Vec3b>(p);
+		Y += 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0];
+	}
+	Y /= seeds.size();
+	return Y;
+}
+
+void seed_growing(const int& threshold) {
+	for (int c = 0; c < src.rows * src.cols; c++) {			// 히스토그램 계산 필수
+		if (distances_norm[c] < threshold) {
+			int y = c / src.cols;
+			int x = c % src.cols;
+			Point anchor = Point(x, y);
+			for (Point seed : seeds) {
+				if (get_Point_distance(anchor, seed) < 10) {
+					growing.push_back(anchor);
+					break;
+				}
+			}
+		}
+	}
+	for (Point grow : growing) {
+		shadow_seed.at<Vec3b>(grow) = src.at<Vec3b>(grow);
+		seeds.push_back(grow);
+	}
+}
+
+void all_pixel_calculate(Vec3b& seeds) {
+	for (int j = 0; j < src.rows; j++) {
+		for (int i = 0; i < src.cols; i++) {
+			/*double distance = 1 - RGB_distance(seeds, src.at<Vec3b>(j, i));
+			distances.push_back(distance);*/
+			//distances.push_back(Y_distance(seeds, src.at<Vec3b>(j, i)));
+			double distance = 1 - CbCr_distance(seeds, src.at<Vec3b>(j, i));
+			distances.push_back(distance);
+		}
+	}
+
+	normalize_vector(distances, distances_norm);
+	Mat dis = Mat(distances_norm);
+	dis.convertTo(dis, CV_8UC1);
+	Mat hist = calcGrayHist(dis);
+	Mat hist_blurred;
+	GaussianBlur(hist, hist_blurred, Size(), 5);
+	seed_growing(get_threshold(hist_blurred));
+}
+
+void region_growing() {
+	for (int i = 0; i < 3; i++) {
+		double Y = get_seed_Y();
+		Vec3b median_value = get_median();
+		all_pixel_calculate(median_value);
+		distances.clear();
+		distances_norm.clear();
+	}
+}
+
+void compare_Y(double Y) {
+	for (int j = 0; j < ML.rows; j++) {
+		for (int i = 0; i < ML.cols; i++) {
+			Vec3b& color = ML.at<Vec3b>(j, i);
+			if (Y_distance(Y, color) < 25) {
+				Point anchor = Point(i, j);
+				for (Point seed : seeds) {
+					if (get_Point_distance(anchor, seed) < 10) {
+						Y_growing.push_back(Point(i, j));
+						break;
 					}
 				}
 			}
-			imshow("dst", dst);
+		}
+	}
+}
 
+double get_standard_deviation(Mat& mt) {
+	return 0;
+}
+void compare_CbCr(Vec3b& seed) {
+	for (int j = 0; j < ML.rows; j++) {
+		for (int i = 0; i < ML.cols; i++) {
+			Vec3b& color = ML.at<Vec3b>(j, i);
+			double distance = 1 - CbCr_distance(seed, color);
+			if (distance < 1e-4) {
+				Point anchor = Point(i, j);
+				for (Point seed : seeds) {
+					if (get_Point_distance(anchor, seed) < 10) {
+						CbCr_growing.push_back(Point(i, j));
+						break;
+					}
+				}
+			}
+		}
+	}
+	for (Point p : CbCr_growing) {
+		seeds.push_back(p);
+	}
+}
+
+
+void get_A_MS() {
+	A = src.clone();
+	MS = shadow_seed.clone();
+	subtract(A, MS, ML);
+	double Y = get_seed_Y();
+	Mat result = MS.clone();
+	while(1){
+
+		/*compare_Y(Y);
+		for (Point grow : Y_growing) {
+			MS.at<Vec3b>(grow) = A.at<Vec3b>(grow);
+		}*/
+		Vec3b median_value = get_median();
+		compare_CbCr(median_value);
+		for (Point grow : CbCr_growing) {
+			MS.at<Vec3b>(grow) = A.at<Vec3b>(grow);
+		}
+		CbCr_growing.clear();
+		subtract(A, MS, ML);
+		
+		Scalar mean_MS, std_dev_MS, mean_ML, std_dev_ML;
+		meanStdDev(MS, mean_MS, std_dev_MS);
+		meanStdDev(ML, mean_ML, std_dev_ML);
+		double mean_sdv_MS = (std_dev_MS[0] + std_dev_MS[1] + std_dev_MS[2]) / 3;
+		double mean_sdv_ML = (std_dev_ML[0] + std_dev_ML[1] + std_dev_ML[2]) / 3;
+		cout << mean_sdv_MS << " " << mean_sdv_ML << endl;
+		if (mean_sdv_MS > mean_sdv_ML) {
 			break;
 		}
-	}
-}
-
-void getSeed(Mat& src) {
-	dst = Mat::zeros(src.size(), CV_8UC1);
-	namedWindow("src");
-	imshow("src", src);
-	setMouseCallback("src", mouse_click);	
-}
-
-void makeSeed(Mat& src, Mat& dst) {	
-	while (!seed.empty())
-	{
-		Point  topPoint = seed.top();
-		seed.pop();
-		Vec3b& seedColor = src.at<Vec3b>(topPoint.y, topPoint.x);
-		for (int i = 0; i < 8; i++)
-		{
-
-			Point p = topPoint + pointArray[i];//p is the point to grow
-			int x = p.x;
-			int y = p.y;
-
-			if (x<0 || y<0 || x>src.cols - 1 || y>src.rows - 1)
-			{
-
-				continue;
-			}
-			Vec3b& srcColor = src.at<Vec3b>(y, x);
-			double srcColor_length = powf((srcColor[0] ^ 2 + srcColor[1] ^ 2 + srcColor[2] ^ 2), 1. / 3);
-			double seedColor_length = powf((seedColor[0] ^ 2 + seedColor[1] ^ 2 + seedColor[2] ^ 2), 1. / 3);
-			double distance = 1 - srcColor.dot(seedColor) / (srcColor_length * seedColor_length);
-			//The second point is not growing and the absolute value of the gray difference between the point to be grown and the first seed point is less than 10, then grow
-			if (distance < 0.1)
-			{
-				dst.at<uchar>(y, x) = 255;//Use gray to indicate growth
-			   //Put this point on the stack
-				seed.push(p);
-			}
+		else {
+			result.release();
+			result = MS.clone();
+			imshow("A", A);
+			imshow("MS", MS);
+			imshow("ML", ML);
+			waitKey(10);
 		}
 	}
-	imshow("dst", dst);
+	imshow("A", A);
+	imshow("MS", MS);
+	imshow("ML", ML);
+}
+
+void get_seed(int event, int x, int y, int flags, void*) {
+	static int seed_count = 0;
+	switch (event)
+	{
+	case EVENT_LBUTTONDOWN:
+		if (seed_count < 3) {
+			Point anchor = Point(x, y);
+			for (int i = 0; i < 25; i++) {
+				Point pt = anchor + pointArray[i];
+				shadow_seed.at<Vec3b>(pt) = src.at<Vec3b>(pt);
+				seeds.push_back(pt);
+			}
+			seed_count++;
+			if (seed_count == 3) {
+				region_growing();
+				imshow("shadow_seed", shadow_seed);
+				get_A_MS();
+			}
+		}
+		break;
+	default:
+		break;
+	}
+
 }
 
 int main(void) {
@@ -169,13 +380,17 @@ int main(void) {
 	destroyAllWindows();
 #endif
 #if DETECTION == 1
-	src = imread("./src/shadow.jpg");
-	resize(src, src, Size(), 0.5, 0.5, INTER_AREA);
-	GaussianBlur(src, src, Size(), 3.0);
-	getSeed(src);
-	//makeSeed(src, dst);
+	src = imread("./src/shadow5.png");
+	resize(src, src, Size(300, 400), 0, 0, INTER_AREA);
+	shadow_seed = Mat::zeros(src.size(), CV_8UC3);
+	imshow("original", src);
+	Mat src_filtered;
+	bilateralFilter(src, src_filtered, -1, 10, 5);
+	src = src_filtered;
+	namedWindow("src");
+	imshow("src", src);
+	setMouseCallback("src", get_seed);
 	waitKey();
 	destroyAllWindows();
 #endif
-
 }
